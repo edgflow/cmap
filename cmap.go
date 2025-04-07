@@ -1,4 +1,4 @@
-// Package flurry implements a concurrent hash map similar to Java's ConcurrentHashMap
+// Package cmap implements a concurrent hash map similar to Java's ConcurrentHashMap
 package cmap
 
 import (
@@ -39,8 +39,8 @@ type Table struct {
 	bins []atomic.Value // []BinEntry
 }
 
-// FlurryHashMap is a concurrent hash map implementation
-type FlurryHashMap struct {
+// Cmap is a concurrent hash map implementation
+type Cmap struct {
 	table         atomic.Value // *Table
 	nextTable     atomic.Value // *Table
 	transferIndex int64        // atomic
@@ -49,9 +49,9 @@ type FlurryHashMap struct {
 	hasher        func(interface{}) uint64
 }
 
-// NewFlurryHashMap creates a new concurrent hash map
-func NewFlurryHashMap() *FlurryHashMap {
-	return &FlurryHashMap{
+// NewCmap creates a new concurrent hash map
+func NewCmap() *Cmap {
+	return &Cmap{
 		hasher:  defaultHasher,
 		sizeCtl: int64(DefaultCapacity),
 	}
@@ -78,12 +78,12 @@ func defaultHasher(key interface{}) uint64 {
 }
 
 // hash computes the hash for a key
-func (m *FlurryHashMap) hash(key interface{}) uint64 {
+func (m *Cmap) hash(key interface{}) uint64 {
 	return m.hasher(key)
 }
 
 // Get retrieves a value for the given key
-func (m *FlurryHashMap) Get(key interface{}) (interface{}, bool) {
+func (m *Cmap) Get(key interface{}) (interface{}, bool) {
 	h := m.hash(key)
 
 	// Load the current table
@@ -118,7 +118,7 @@ func (m *FlurryHashMap) Get(key interface{}) (interface{}, bool) {
 }
 
 // findInBin searches for a key in a bin
-func (m *FlurryHashMap) findInBin(bin *BinEntry, hash uint64, key interface{}) *Node {
+func (m *Cmap) findInBin(bin *BinEntry, hash uint64, key interface{}) *Node {
 	switch bin.entryType {
 	case NodeType:
 		node := (*Node)(bin.ptr)
@@ -155,17 +155,17 @@ func (n *Node) find(hash uint64, key interface{}) *Node {
 }
 
 // Put adds or updates a key-value pair
-func (m *FlurryHashMap) Put(key, value interface{}) (interface{}, bool) {
+func (m *Cmap) Put(key, value interface{}) (interface{}, bool) {
 	return m.put(key, value, false)
 }
 
 // PutIfAbsent adds a key-value pair only if the key doesn't exist
-func (m *FlurryHashMap) PutIfAbsent(key, value interface{}) (interface{}, bool) {
+func (m *Cmap) PutIfAbsent(key, value interface{}) (interface{}, bool) {
 	return m.put(key, value, true)
 }
 
 // put is the internal implementation for adding/updating entries
-func (m *FlurryHashMap) put(key, value interface{}, onlyIfAbsent bool) (interface{}, bool) {
+func (m *Cmap) put(key, value interface{}, onlyIfAbsent bool) (interface{}, bool) {
 	h := m.hash(key)
 
 	var table *Table
@@ -271,12 +271,12 @@ func (m *FlurryHashMap) put(key, value interface{}, onlyIfAbsent bool) (interfac
 }
 
 // getBinIndex calculates the bin index for a hash value
-func (m *FlurryHashMap) getBinIndex(hash uint64, binCount int) int {
+func (m *Cmap) getBinIndex(hash uint64, binCount int) int {
 	return int(hash & uint64(binCount-1))
 }
 
 // initTable initializes the table
-func (m *FlurryHashMap) initTable() *Table {
+func (m *Cmap) initTable() *Table {
 	for {
 		sizeCtl := atomic.LoadInt64(&m.sizeCtl)
 		if sizeCtl < 0 {
@@ -312,7 +312,7 @@ func (m *FlurryHashMap) initTable() *Table {
 }
 
 // addCount adds to the count and triggers a resize if needed
-func (m *FlurryHashMap) addCount(delta int64, binCount int) {
+func (m *Cmap) addCount(delta int64, binCount int) {
 	// Add to count
 	if delta != 0 {
 		if delta > 0 {
@@ -380,13 +380,13 @@ func (m *FlurryHashMap) addCount(delta int64, binCount int) {
 }
 
 // helpTransfer helps with a table transfer
-func (m *FlurryHashMap) helpTransfer(table *Table, ptr unsafe.Pointer) {
+func (m *Cmap) helpTransfer(table *Table, ptr unsafe.Pointer) {
 	nextTable := (*Table)(ptr)
 	m.transfer(table, nextTable)
 }
 
 // transfer handles moving entries to the new table during resize
-func (m *FlurryHashMap) transfer(table *Table, nextTable *Table) {
+func (m *Cmap) transfer(table *Table, nextTable *Table) {
 	n := len(table.bins)
 	stride := MinTransferStride
 

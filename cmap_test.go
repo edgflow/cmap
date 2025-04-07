@@ -8,6 +8,7 @@ import (
 func TestFlurryHashMap_Get(t *testing.T) {
 	f := NewFlurryHashMap()
 	f.Put("hi", 1)
+	fmt.Println(f.Put("hi", 2))
 	f.Put("hi1", 2)
 	fmt.Println(f.Get("hi"))
 }
