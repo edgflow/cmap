@@ -41,7 +41,7 @@ import (
         "fmt"
         "sync"
 
-        "github.com/<github-user>/cmap" // ← update import path
+        "github.com/edgflow/cmap" // ← update import path
 )
 
 func main() {
