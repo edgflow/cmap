@@ -28,3 +28,10 @@ const (
 	// ResizeStampShift is the bit shift for recording size stamp in sizeCtl.
 	ResizeStampShift = 32 - ResizeStampBits
 )
+
+// Constants needed for the implementation
+const (
+	MAXIMUM_CAPACITY = 1 << 30
+	DEFAULT_CAPACITY = 16
+	MAX_RESIZERS     = 65535
+)

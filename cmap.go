@@ -4,6 +4,7 @@ package cmap
 import (
 	"encoding/binary"
 	"hash/fnv"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -117,40 +118,87 @@ func (m *Cmap) Get(key interface{}) (interface{}, bool) {
 	return v, true
 }
 
-// findInBin searches for a key in a bin
+// findInBin searches for a key in a bin, following the same pattern as the Rust code
 func (m *Cmap) findInBin(bin *BinEntry, hash uint64, key interface{}) *Node {
 	switch bin.entryType {
 	case NodeType:
+		// We're in a regular node bin
 		node := (*Node)(bin.ptr)
 		return node.find(hash, key)
+
 	case MovedType:
-		// If the bin has been moved, we need to follow the forwarding pointer
+		// The bin has been moved, we need to follow the pointer to the next table
 		nextTable := (*Table)(bin.ptr)
-		// Get the bin in the next table
-		bini := m.getBinIndex(hash, len(nextTable.bins))
-		binVal := nextTable.bins[bini].Load()
-		if binVal == nil {
-			return nil
+
+		// Loop to handle potential multiple forwards (matching Rust's loop approach)
+		for {
+			if nextTable == nil {
+				return nil
+			}
+
+			// Get the bin index in the next table
+			bini := m.getBinIndex(hash, len(nextTable.bins))
+
+			// Load the bin
+			binVal := nextTable.bins[bini].Load()
+			if binVal == nil {
+				return nil
+			}
+
+			// Convert to BinEntry
+			nextBin := binVal.(BinEntry)
+
+			// Based on the type, either find in this bin or follow another forward pointer
+			switch nextBin.entryType {
+			case NodeType:
+				// Found a node bin, search in it
+				return m.findInBin(&nextBin, hash, key)
+
+			case MovedType:
+				// Another forward, continue the loop
+				nextTable = (*Table)(nextBin.ptr)
+				continue
+			}
 		}
-		nextBin := binVal.(BinEntry)
-		return m.findInBin(&nextBin, hash, key)
 	}
+
 	return nil
 }
 
-// find searches for a key in a node chain
+// find searches for a key in a node chain using a recursive approach
+// to match the Rust implementation more closely
 func (n *Node) find(hash uint64, key interface{}) *Node {
+	// Check if this is the node we're looking for
+	if n.hash == hash && n.key == key {
+		return n
+	}
+
+	// Check the next node
+	nextVal := n.next.Load()
+	if nextVal == nil {
+		return nil
+	}
+
+	// Recursively check the next node
+	return nextVal.(*Node).find(hash, key)
+}
+
+// Non-recursive version of find for better Go performance (optional)
+func (n *Node) findIterative(hash uint64, key interface{}) *Node {
 	current := n
 	for current != nil {
 		if current.hash == hash && current.key == key {
 			return current
 		}
+
 		nextVal := current.next.Load()
 		if nextVal == nil {
 			return nil
 		}
+
 		current = nextVal.(*Node)
 	}
+
 	return nil
 }
 
@@ -166,107 +214,119 @@ func (m *Cmap) PutIfAbsent(key, value interface{}) (interface{}, bool) {
 
 // put is the internal implementation for adding/updating entries
 func (m *Cmap) put(key, value interface{}, onlyIfAbsent bool) (interface{}, bool) {
-	h := m.hash(key)
+	// Calculate hash for the key
+	hash := m.hasher(key)
 
-	var table *Table
-	var created bool
+	// Create a new node to insert (we'll reuse this if insertion fails)
+	node := &Node{
+		hash: hash,
+		key:  key,
+	}
+	node.value.Store(value)
+	nodeEntry := BinEntry{
+		entryType: NodeType,
+		ptr:       unsafe.Pointer(node),
+	}
 
+	// Main insertion loop
 	for {
+		// Get current table or initialize if needed
 		tableVal := m.table.Load()
-		if tableVal == nil {
-			// Initialize the table if it doesn't exist
+		var table *Table
+		if tableVal == nil || tableVal.(*Table).bins == nil || len(tableVal.(*Table).bins) == 0 {
 			table = m.initTable()
 			continue
+		} else {
+			table = tableVal.(*Table)
 		}
 
-		table = tableVal.(*Table)
-		if len(table.bins) == 0 {
-			table = m.initTable()
-			continue
-		}
+		// Calculate bin index
+		bini := int(hash & uint64(len(table.bins)-1))
 
-		bini := m.getBinIndex(h, len(table.bins))
+		// Load the bin at the index
 		binVal := table.bins[bini].Load()
 
+		// Fast path - bin is empty
 		if binVal == nil {
-			// Fast path - bin is empty
-			node := &Node{
-				hash: h,
-				key:  key,
+			// Try to CAS our node into the empty bin
+			if table.bins[bini].CompareAndSwap(nil, nodeEntry) {
+				// Successful insertion, update count and return
+				m.addCount(1, 0)
+				return nil, true
 			}
-			node.value.Store(value)
-
-			bin := BinEntry{
-				entryType: NodeType,
-				ptr:       unsafe.Pointer(node),
+			// CAS failed, reload the bin and try again
+			binVal = table.bins[bini].Load()
+			if binVal == nil {
+				continue // Retry if bin is still empty
 			}
-
-			table.bins[bini].CompareAndSwap(nil, bin)
-			// Even if CAS fails, we simply retry the loop
-			continue
 		}
 
+		// Convert to BinEntry
 		bin := binVal.(BinEntry)
 
+		// Handle forwarding nodes (the bin has been moved during resize)
 		if bin.entryType == MovedType {
-			// Help with the transfer and retry
+			//nextTable := (*Table)(bin.ptr)
 			m.helpTransfer(table, bin.ptr)
-			continue
+			continue // Retry with the new table
 		}
 
-		// Slow path - bin is non-empty
-		node := (*Node)(bin.ptr)
-		node.mu.Lock()
+		// At this point, we have a Node bin
+		head := (*Node)(bin.ptr)
 
-		// Recheck that the bin hasn't changed
+		// Quick check for first node match when replacement is disallowed
+		if onlyIfAbsent && head.hash == hash && head.key == key {
+			return head.value.Load(), false
+		}
+
+		// Need to take the bin lock to modify the chain
+		head.mu.Lock()
+
+		// Re-check that the head hasn't changed while we were waiting
 		currentBinVal := table.bins[bini].Load()
 		if currentBinVal != binVal {
-			node.mu.Unlock()
-			continue
+			head.mu.Unlock()
+			continue // Head changed, retry
 		}
 
 		// Now we "own" the bin
-		//var oldValue interface{}
 		binCount := 1
-		current := node
+		current := head
 
-		// Check if key already exists in the bin
+		// Traverse the bin looking for our key
 		for {
-			if current.hash == h && current.key == key {
+			// If we find the key, update or return based on onlyIfAbsent
+			if current.hash == hash && current.key == key {
 				oldVal := current.value.Load()
-				if onlyIfAbsent {
-					node.mu.Unlock()
-					return oldVal, false
+				if !onlyIfAbsent {
+					// Update the value
+					current.value.Store(value)
 				}
-				current.value.Store(value)
-				node.mu.Unlock()
+				head.mu.Unlock()
 				return oldVal, false
 			}
 
+			// Check the next node
 			nextVal := current.next.Load()
 			if nextVal == nil {
-				// End of the chain, append new node
+				// We've reached the end - append our new node
 				newNode := &Node{
-					hash: h,
+					hash: hash,
 					key:  key,
 				}
 				newNode.value.Store(value)
 				current.next.Store(newNode)
-				created = true
-				break
+				head.mu.Unlock()
+
+				// Update the count
+				m.addCount(1, binCount)
+				return nil, true
 			}
 
+			// Move to the next node
 			current = nextVal.(*Node)
 			binCount++
 		}
-
-		node.mu.Unlock()
-
-		if created {
-			m.addCount(1, binCount)
-		}
-
-		return nil, created
 	}
 }
 
@@ -275,67 +335,83 @@ func (m *Cmap) getBinIndex(hash uint64, binCount int) int {
 	return int(hash & uint64(binCount-1))
 }
 
-// initTable initializes the table
+// initTable initializes the hash table if needed
 func (m *Cmap) initTable() *Table {
 	for {
-		sizeCtl := atomic.LoadInt64(&m.sizeCtl)
-		if sizeCtl < 0 {
-			// Someone else is initializing
-			// Yield to allow them to progress
+		tableVal := m.table.Load()
+		if tableVal != nil {
+			table := tableVal.(*Table)
+			if table.bins != nil && len(table.bins) > 0 {
+				return table
+			}
+		}
+
+		// Try to allocate the table
+		sc := atomic.LoadInt64(&m.sizeCtl)
+		if sc < 0 {
+			// We lost the initialization race, just yield and spin
+			runtime.Gosched() // Similar to std::thread::yield_now()
 			continue
 		}
 
-		if atomic.CompareAndSwapInt64(&m.sizeCtl, sizeCtl, -1) {
-			// We are now responsible for initialization
-			tableVal := m.table.Load()
-			if tableVal != nil {
-				// Another thread beat us to it
-				atomic.StoreInt64(&m.sizeCtl, sizeCtl)
-				return tableVal.(*Table)
+		// Try to claim initialization responsibility
+		if atomic.CompareAndSwapInt64(&m.sizeCtl, sc, -1) {
+			// We get to do it!
+			tableVal = m.table.Load()
+			var table *Table
+
+			if tableVal == nil || tableVal.(*Table).bins == nil || len(tableVal.(*Table).bins) == 0 {
+				// Create a new table
+				n := DEFAULT_CAPACITY
+				if sc > 0 {
+					n = int(sc)
+				}
+
+				table = &Table{
+					bins: make([]atomic.Value, n),
+				}
+				m.table.Store(table)
+
+				// Update size control to threshold (n - n/4)
+				sc = int64(n) - int64(n>>2)
+			} else {
+				table = tableVal.(*Table)
 			}
 
-			capacity := DefaultCapacity
-			if sizeCtl > 0 {
-				capacity = int(sizeCtl)
-			}
-
-			table := &Table{
-				bins: make([]atomic.Value, capacity),
-			}
-			m.table.Store(table)
-
-			// Update size control threshold
-			atomic.StoreInt64(&m.sizeCtl, int64(float64(capacity)*LoadFactor))
+			// Reset size control
+			atomic.StoreInt64(&m.sizeCtl, sc)
 			return table
 		}
 	}
 }
 
-// addCount adds to the count and triggers a resize if needed
-func (m *Cmap) addCount(delta int64, binCount int) {
-	// Add to count
-	if delta != 0 {
-		if delta > 0 {
-			atomic.AddUint64(&m.count, uint64(delta))
-		} else {
-			atomic.AddUint64(&m.count, ^uint64(-delta-1))
-		}
+// addCount updates the counter and potentially triggers a resize
+func (m *Cmap) addCount(n int64, binCount int) {
+	// Update count based on the sign of n
+	var count uint64
+	if n > 0 {
+		count = atomic.AddUint64(&m.count, uint64(n))
+	} else if n < 0 {
+		absN := uint64(-n)
+		count = atomic.AddUint64(&m.count, ^(absN - 1)) // Equivalent to subtract in two's complement
+	} else {
+		count = atomic.LoadUint64(&m.count)
 	}
 
-	// Check if resize is needed
-	if binCount == 0 {
+	// If binCount is negative, the caller does not want us to consider a resize
+	if binCount < 0 {
 		return
 	}
 
+	// Consider resize
 	for {
-		sizeCtl := atomic.LoadInt64(&m.sizeCtl)
-		currentCount := atomic.LoadUint64(&m.count)
-
-		if int64(currentCount) < sizeCtl {
-			// Not at resize threshold yet
+		sc := atomic.LoadInt64(&m.sizeCtl)
+		if int64(count) < sc {
+			// We're not at the next resize point yet
 			break
 		}
 
+		// Get current table
 		tableVal := m.table.Load()
 		if tableVal == nil {
 			// Table will be initialized by another thread
@@ -344,79 +420,132 @@ func (m *Cmap) addCount(delta int64, binCount int) {
 
 		table := tableVal.(*Table)
 		n := len(table.bins)
-
-		if n >= MaximumCapacity {
+		if n >= MAXIMUM_CAPACITY {
+			// Can't resize any more
 			break
 		}
 
-		rs := resizeStamp(n) << ResizeStampShift
+		// Calculate resize stamp
+		rs := resizeStamp(n) << RESIZE_STAMP_SHIFT
 
-		if sizeCtl < 0 {
-			// Ongoing resize
-			if sizeCtl == rs+int64(MaxResizers) || sizeCtl == rs+1 {
+		if sc < 0 {
+			// Ongoing resize! Can we join?
+			if sc == rs+MAX_RESIZERS || sc == rs+1 {
 				break
 			}
 
+			// Check nextTable
 			nextTableVal := m.nextTable.Load()
 			if nextTableVal == nil {
 				break
 			}
 
+			nextTable := nextTableVal.(*Table)
+
+			// Check if there's still work to do
 			if atomic.LoadInt64(&m.transferIndex) <= 0 {
 				break
 			}
 
-			// Try to join the transfer
-			if atomic.CompareAndSwapInt64(&m.sizeCtl, sizeCtl, sizeCtl+1) {
-				m.transfer(table, nextTableVal.(*Table))
+			// Try to join the resize operation
+			if atomic.CompareAndSwapInt64(&m.sizeCtl, sc, sc+1) {
+				m.transfer(table, nextTable)
 			}
-		} else if atomic.CompareAndSwapInt64(&m.sizeCtl, sizeCtl, rs+2) {
-			// Initiate resize
+		} else if atomic.CompareAndSwapInt64(&m.sizeCtl, sc, rs+2) {
+			// A resize is needed but hasn't started yet
+			// Start a new resize operation
 			m.transfer(table, nil)
 		}
 
-		// Another resize might be needed
+		// Another resize may be needed
+		count = atomic.LoadUint64(&m.count)
 	}
 }
 
 // helpTransfer helps with a table transfer
-func (m *Cmap) helpTransfer(table *Table, ptr unsafe.Pointer) {
+func (m *Cmap) helpTransfer(table *Table, ptr unsafe.Pointer) *Table {
 	nextTable := (*Table)(ptr)
-	m.transfer(table, nextTable)
+	// helpTransfer helps with a table transfer for concurrent resizing operations.
+	// It participates in the transfer when another thread is already expanding the table.
+	// Early return if either table is nil/null
+	if table == nil || nextTable == nil {
+		return table
+	}
+
+	// Calculate resize stamp - identifies the current resize operation
+	rs := resizeStamp(len(table.bins)) << ResizeStampShift
+
+	// Try to help with transfer as long as conditions remain stable
+	for atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&m.nextTable))) == unsafe.Pointer(nextTable) &&
+		atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&m.table))) == unsafe.Pointer(table) {
+
+		// Load current size control value atomically
+		sc := atomic.LoadInt64(&m.sizeCtl)
+
+		// Exit conditions - no help needed if:
+		// 1. sc >= 0: resize operation completed
+		// 2. sc == rs + MAX_RESIZERS: max helpers already working
+		// 3. sc == rs + 1: resize operation finished but not yet reset
+		// 4. transferIndex <= 0: no more bins to process
+		if sc >= 0 ||
+			sc == rs+MaxResizers ||
+			sc == rs+1 ||
+			atomic.LoadInt64(&m.transferIndex) <= 0 {
+			break
+		}
+
+		// Try to increment helper count
+		if atomic.CompareAndSwapInt64(&m.sizeCtl, sc, sc+1) {
+			// Successfully registered as helper, do transfer work
+			m.transfer(table, nextTable)
+			break
+		}
+	}
+
+	return nextTable
+
 }
+
+const (
+	RESIZE_STAMP_BITS   = 16
+	RESIZE_STAMP_SHIFT  = 16
+	MIN_TRANSFER_STRIDE = 16
+)
 
 // transfer handles moving entries to the new table during resize
 func (m *Cmap) transfer(table *Table, nextTable *Table) {
 	n := len(table.bins)
-	stride := MinTransferStride
+	stride := MIN_TRANSFER_STRIDE
 
+	// If nextTable is nil, we're initiating a resize
 	if nextTable == nil {
 		// Create a new table with double the size
 		nextTable = &Table{
 			bins: make([]atomic.Value, n<<1),
 		}
+		// Swap in the new next table
 		m.nextTable.Store(nextTable)
 		atomic.StoreInt64(&m.transferIndex, int64(n))
 	}
 
 	nextN := len(nextTable.bins)
-	advancing := true
+	advance := true
 	finishing := false
 	var i, bound int
 
 	for {
-		// Try to claim a range of bins to transfer
-		for advancing {
+		// Try to claim a range of bins for transfer
+		for advance {
 			i--
 			if i >= bound || finishing {
-				advancing = false
+				advance = false
 				break
 			}
 
 			nextIndex := atomic.LoadInt64(&m.transferIndex)
 			if nextIndex <= 0 {
 				i = -1
-				advancing = false
+				advance = false
 				break
 			}
 
@@ -427,35 +556,40 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 
 			if atomic.CompareAndSwapInt64(&m.transferIndex, nextIndex, nextBound) {
 				bound = int(nextBound)
-				i = int(nextIndex)
-				advancing = false
+				i = int(nextIndex) - 1 // Adjust to match the rust decrementation
+				advance = false
 				break
 			}
 		}
 
 		if i < 0 || i >= n || i+n >= nextN {
 			// The resize has finished
+
 			if finishing {
-				// This branch is only taken by one thread
+				// This branch is only taken by one thread to finish the resize
 				m.nextTable.Store(nil)
 				m.table.Store(nextTable)
+				// Set the new threshold for the next resize
 				atomic.StoreInt64(&m.sizeCtl, int64((n<<1)-(n>>1)))
 				return
 			}
 
 			sc := atomic.LoadInt64(&m.sizeCtl)
 			if atomic.CompareAndSwapInt64(&m.sizeCtl, sc, sc-1) {
-				if (sc - 2) != resizeStamp(n)<<ResizeStampShift {
+				// Check if we're the last worker thread
+				if (sc - 2) != resizeStamp(n)<<RESIZE_STAMP_SHIFT {
 					return
 				}
 
+				// We are the chosen thread to finish the resize
 				finishing = true
-				advancing = true
-				i = n
+				advance = true
+				i = n // Start from the end as per the rust code
 			}
 			continue
 		}
 
+		// Get the bin at index i
 		binVal := table.bins[i].Load()
 		if binVal == nil {
 			// Bin is empty, mark it as moved
@@ -464,8 +598,9 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 				ptr:       unsafe.Pointer(nextTable),
 			}
 
+			// Try to CAS the bin
 			if table.bins[i].CompareAndSwap(nil, movedBin) {
-				advancing = true
+				advance = true
 			}
 			continue
 		}
@@ -474,11 +609,11 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 
 		if bin.entryType == MovedType {
 			// Already processed
-			advancing = true
+			advance = true
 			continue
 		}
 
-		// Process a node bin
+		// Must be a Node type
 		node := (*Node)(bin.ptr)
 		node.mu.Lock()
 
@@ -489,13 +624,13 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 			continue
 		}
 
-		// Split nodes into low (same index) and high (index + n) bins
-		runBit := (node.hash & uint64(n)) != 0
-
 		// Find the last run of nodes with same destination
+		runBit := (node.hash & uint64(n)) != 0
 		lastRun := node
-		var p *Node
-		for p = node; ; {
+		p := node
+
+		// Traverse the linked list to find the last run
+		for {
 			nextVal := p.next.Load()
 			if nextVal == nil {
 				break
@@ -511,51 +646,51 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 			p = next
 		}
 
-		// Clone nodes up to the last run
+		// Set up low and high bins
 		var lowBin, highBin *Node
 		if !runBit {
+			// The last run belongs in the low bin
 			lowBin = lastRun
 		} else {
+			// The last run belongs in the high bin
 			highBin = lastRun
 		}
 
-		// Clone nodes that don't match the last run
-		for p = node; p != lastRun; {
+		// Process all nodes before the last run
+		// These need to be cloned since they might go to different bins
+		p = node
+		for p != lastRun {
 			nextVal := p.next.Load()
-			var next *Node
+			next := (*Node)(nil)
 			if nextVal != nil {
 				next = nextVal.(*Node)
 			}
 
 			pRunBit := (p.hash & uint64(n)) != 0
-			var newNode = &Node{
+
+			// Create a new node with the same data
+			newNode := &Node{
 				hash: p.hash,
 				key:  p.key,
+				mu:   sync.Mutex{}, // New mutex
 			}
 			newNode.value.Store(p.value.Load())
 
+			// Determine which bin to put it in
 			if pRunBit {
-				// Add to high bin
-				if highBin == nil {
-					highBin = newNode
-				} else {
-					newNode.next.Store(highBin)
-					highBin = newNode
-				}
+				// To high bin
+				newNode.next.Store(highBin)
+				highBin = newNode
 			} else {
-				// Add to low bin
-				if lowBin == nil {
-					lowBin = newNode
-				} else {
-					newNode.next.Store(lowBin)
-					lowBin = newNode
-				}
+				// To low bin
+				newNode.next.Store(lowBin)
+				lowBin = newNode
 			}
 
 			p = next
 		}
 
-		// Store bins in new table
+		// Store the bins in the next table
 		if lowBin != nil {
 			lowBinEntry := BinEntry{
 				entryType: NodeType,
@@ -572,7 +707,7 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 			nextTable.bins[i+n].Store(highBinEntry)
 		}
 
-		// Mark old bin as moved
+		// Mark the old bin as moved
 		movedBin := BinEntry{
 			entryType: MovedType,
 			ptr:       unsafe.Pointer(nextTable),
@@ -580,7 +715,7 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 		table.bins[i].Store(movedBin)
 
 		node.mu.Unlock()
-		advancing = true
+		advance = true
 	}
 }
 
