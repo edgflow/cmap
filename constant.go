@@ -33,5 +33,16 @@ const (
 const (
 	MAXIMUM_CAPACITY = 1 << 30
 	DEFAULT_CAPACITY = 16
-	MAX_RESIZERS     = 65535
+	LOAD_FACTOR      = 0.75
+	// The number of bits used for generation stamp in size_ctl
+	RESIZE_STAMP_BITS = 16
+
+	// Minimum number of rebinnings per transfer step
+	MIN_TRANSFER_STRIDE = 16
+
+	// The maximum number of threads that can help resize
+	MAX_RESIZERS = (1 << (32 - RESIZE_STAMP_BITS)) - 1
+
+	// The bit shift for recording size stamp in size_ctl
+	RESIZE_STAMP_SHIFT = 32 - RESIZE_STAMP_BITS
 )
