@@ -50,11 +50,31 @@ type Cmap struct {
 	hasher        func(interface{}) uint64
 }
 
+// WithCapacity creates a new map with the specified initial capacity
+func WithCapacity(n int) *Cmap {
+	if n <= 0 {
+		panic("capacity must be positive")
+	}
+	m := New()
+
+	// Calculate target size similar to Rust implementation
+	size := int(float64(n)/loadFactor) + 1
+
+	// Find next power of two, capped at maximum capacity
+	cap := nextPowerOfTwo(size)
+	if cap > maximumCapacity {
+		cap = maximumCapacity
+	}
+
+	m.sizeCtl = int64(cap)
+	return m
+}
+
 // NewCmap creates a new concurrent hash map
 func New() *Cmap {
 	return &Cmap{
 		hasher:  defaultHasher,
-		sizeCtl: int64(DefaultCapacity),
+		sizeCtl: int64(defaultCapacity),
 	}
 }
 
@@ -155,44 +175,6 @@ func (m *Cmap) Get(key interface{}) (interface{}, bool) {
 	// Return the loaded value and true (indicating key was found).
 	// Equivalent to `Some(v)`.
 	return v, true
-}
-
-// WithCapacity creates a new map with the specified initial capacity
-func WithCapacity(n int) *Cmap {
-	if n <= 0 {
-		panic("capacity must be positive")
-	}
-	m := New()
-
-	// Calculate target size similar to Rust implementation
-	size := int(float64(n)/LOAD_FACTOR) + 1
-
-	// Find next power of two, capped at maximum capacity
-	cap := nextPowerOfTwo(size)
-	if cap > MAXIMUM_CAPACITY {
-		cap = MAXIMUM_CAPACITY
-	}
-
-	m.sizeCtl = int64(cap)
-	return m
-}
-
-// nextPowerOfTwo returns the next power of two greater than or equal to x
-func nextPowerOfTwo(x int) int {
-	if x <= 0 {
-		return 1
-	}
-	if x >= MAXIMUM_CAPACITY {
-		return MAXIMUM_CAPACITY
-	}
-	// Find the smallest power of 2 >= x
-	x--
-	x |= x >> 1
-	x |= x >> 2
-	x |= x >> 4
-	x |= x >> 8
-	x |= x >> 16
-	return x + 1
 }
 
 // --- Updated Search Logic ---
@@ -454,7 +436,7 @@ func (m *Cmap) initTable() *Table {
 
 			if tableVal == nil || len(tableVal.(*Table).bins) == 0 {
 				// Create a new table
-				n := DEFAULT_CAPACITY
+				n := defaultCapacity
 				if sc > 0 {
 					n = int(sc)
 				}
@@ -510,16 +492,16 @@ func (m *Cmap) addCount(n int64, binCount int, checkForResize bool) {
 
 		table := tableVal.(*Table)
 		n := len(table.bins)
-		if n >= MAXIMUM_CAPACITY {
+		if n >= maximumCapacity {
 			break
 		}
 
 		// Calculate resize stamp
-		rs := resizeStamp(n) << RESIZE_STAMP_SHIFT
+		rs := resizeStamp(n) << resizeStampShift
 
 		if sc < 0 {
 			// Resize already in progress
-			if sc == rs+MAX_RESIZERS || sc == rs+1 {
+			if sc == rs+maxResizers || sc == rs+1 {
 				break
 			}
 
@@ -555,7 +537,7 @@ func (m *Cmap) helpTransfer(table *Table, nextTable *Table) *Table {
 	}
 
 	// Calculate resize stamp
-	rs := resizeStamp(len(table.bins)) << RESIZE_STAMP_SHIFT
+	rs := resizeStamp(len(table.bins)) << resizeStampShift
 
 	for {
 		// Check if conditions are still valid
@@ -571,7 +553,7 @@ func (m *Cmap) helpTransfer(table *Table, nextTable *Table) *Table {
 
 		sc := atomic.LoadInt64(&m.sizeCtl)
 		if sc >= 0 ||
-			sc == rs+MAX_RESIZERS ||
+			sc == rs+maxResizers ||
 			sc == rs+1 ||
 			atomic.LoadInt64(&m.transferIndex) <= 0 {
 			break
@@ -590,7 +572,7 @@ func (m *Cmap) helpTransfer(table *Table, nextTable *Table) *Table {
 // transfer handles moving entries to the new table during resize
 func (m *Cmap) transfer(table *Table, nextTable *Table) {
 	n := len(table.bins)
-	stride := MIN_TRANSFER_STRIDE
+	stride := minTransferStride
 
 	// Initialize nextTable if needed
 	if nextTable == nil {
@@ -657,7 +639,7 @@ func (m *Cmap) transfer(table *Table, nextTable *Table) {
 			sc := atomic.LoadInt64(&m.sizeCtl)
 			if atomic.CompareAndSwapInt64(&m.sizeCtl, sc, sc-1) {
 				// Check if this thread should finish the transfer
-				if (sc - 2) != resizeStamp(n)<<RESIZE_STAMP_SHIFT {
+				if (sc - 2) != resizeStamp(n)<<resizeStampShift {
 					return
 				}
 
@@ -804,7 +786,7 @@ func (m *Cmap) Clear() {
 
 	// Create a new empty table
 	table := &Table{
-		bins: make([]atomic.Value, DEFAULT_CAPACITY),
+		bins: make([]atomic.Value, defaultCapacity),
 	}
 
 	// Reset all fields
@@ -812,38 +794,10 @@ func (m *Cmap) Clear() {
 	m.nextTable.Store(nil)
 	atomic.StoreInt64(&m.transferIndex, 0)
 	atomic.StoreUint64(&m.count, 0)
-	atomic.StoreInt64(&m.sizeCtl, int64(DEFAULT_CAPACITY-(DEFAULT_CAPACITY>>2)))
+	atomic.StoreInt64(&m.sizeCtl, int64(defaultCapacity-(defaultCapacity>>2)))
 }
 
 // resizeStamp returns the stamp bits for resizing a table of size n
 func resizeStamp(n int) int64 {
-	return int64(numberOfLeadingZeros(uint32(n)) | (1 << (RESIZE_STAMP_BITS - 1)))
-}
-
-// numberOfLeadingZeros returns the number of leading zero bits in x
-func numberOfLeadingZeros(x uint32) int {
-	if x == 0 {
-		return 32
-	}
-	n := 0
-	if (x & 0xFFFF0000) == 0 {
-		n += 16
-		x <<= 16
-	}
-	if (x & 0xFF000000) == 0 {
-		n += 8
-		x <<= 8
-	}
-	if (x & 0xF0000000) == 0 {
-		n += 4
-		x <<= 4
-	}
-	if (x & 0xC0000000) == 0 {
-		n += 2
-		x <<= 2
-	}
-	if (x & 0x80000000) == 0 {
-		n += 1
-	}
-	return n
+	return int64(numberOfLeadingZeros(uint32(n)) | (1 << (resizeStampBits - 1)))
 }
