@@ -1,6 +1,3 @@
-Below is a polished, copy‑paste‑ready README.md template.
-Simply do a global search & replace for <github-user> (or any other placeholder) with your actual GitHub user/org (and repo name if it differs from cmap). Add a real license in the License section and you’re good to go! 🚀
-
 
 # Go Concurrent Map – `cmap`
 
